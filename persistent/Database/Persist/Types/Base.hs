@@ -273,6 +273,7 @@ data PersistValue = PersistText Text
                   | PersistMap [(Text, PersistValue)]
                   | PersistObjectId ByteString -- ^ Intended especially for MongoDB backend
                   | PersistDbSpecific ByteString -- ^ Using 'PersistDbSpecific' allows you to use types specific to a particular backend
+                  | PersistDbSpecificUnescaped ByteString -- ^ Using 'PersistDbSpecificUnescaped' allows you to use types specific to a particular backend with Unescaped syntax
 -- For example, below is a simple example of the PostGIS geography type:
 --
 -- @
