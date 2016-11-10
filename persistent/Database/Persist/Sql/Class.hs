@@ -4,7 +4,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE UndecidableInstances #-}
 #ifndef NO_OVERLAP
 {-# LANGUAGE OverlappingInstances #-}
 #endif
@@ -34,6 +36,10 @@ import Text.Blaze.Html (Html)
 import Data.Bits (bitSize)
 import qualified Data.Vector as V
 
+#if MIN_VERSION_base(4,8,0)
+import Numeric.Natural (Natural)
+#endif
+
 -- | Class for data types that may be retrived from a 'rawSql'
 -- query.
 class RawSql a where
@@ -54,15 +60,18 @@ instance PersistField a => RawSql (Single a) where
     rawSqlProcessRow [pv]  = Single <$> fromPersistValue pv
     rawSqlProcessRow _     = Left $ pack "RawSql (Single a): wrong number of columns."
 
-instance (PersistEntity a, PersistEntityBackend a ~ SqlBackend) => RawSql (Key a) where
-  rawSqlCols _ key         = (length $ keyToValues key, [])
-  rawSqlColCountReason key = "The primary key is composed of "
-                             ++ (show $ length $ keyToValues key)
-                             ++ " columns"
-  rawSqlProcessRow         = keyFromValues
+instance
+    (PersistEntity a, PersistEntityBackend a ~ backend, IsPersistBackend backend) =>
+    RawSql (Key a) where
+    rawSqlCols _ key         = (length $ keyToValues key, [])
+    rawSqlColCountReason key = "The primary key is composed of "
+                               ++ (show $ length $ keyToValues key)
+                               ++ " columns"
+    rawSqlProcessRow         = keyFromValues
 
-instance (PersistEntity record, PersistEntityBackend record ~ SqlBackend)
-         => RawSql (Entity record) where
+instance
+    (PersistEntity record, PersistEntityBackend record ~ backend, IsPersistBackend backend) =>
+    RawSql (Entity record) where
     rawSqlCols escape ent = (length sqlFields, [intercalate ", " sqlFields])
         where
           sqlFields = map (((name <> ".") <>) . escape)
@@ -273,6 +282,11 @@ instance (HasResolution a) => PersistFieldSql (Fixed a) where
         _mn = return n `asTypeOf` a
 instance PersistFieldSql Rational where
     sqlType _ = SqlNumeric 32 20   --  need to make this field big enough to handle Rational to Mumber string conversion for ODBC
+
+#if MIN_VERSION_base(4,8,0)
+instance PersistFieldSql Natural where
+  sqlType _ = SqlInt64
+#endif
 
 -- An embedded Entity
 instance (PersistField record, PersistEntity record) => PersistFieldSql (Entity record) where

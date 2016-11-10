@@ -1,3 +1,24 @@
+## 2.6
+
+* Atomic upsert support for postgreSQL backend
+
+## 2.5
+
+* changes for read/write typeclass split
+
+## 2.2.2
+
+* Postgresql primary key is Int4, not Int8 [#519](https://github.com/yesodweb/persistent/issues/519)
+
+## 2.2.1.2
+
+* Allow postgresql-simple 0.5
+
+## 2.2.1.1
+
+Query pg_catalog instead of information_schema for metadata.
+This helps with permission issues as reported in issue #501
+
 ## 2.2.1
 
 * Fix treatment of `NULL`s inside arrays.  For example, now you

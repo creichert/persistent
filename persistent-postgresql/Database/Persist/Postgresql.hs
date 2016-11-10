@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
@@ -6,6 +8,7 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE Rank2Types #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 
 -- | A postgresql backend for persistent.
 module Database.Persist.Postgresql
@@ -24,6 +27,7 @@ module Database.Persist.Postgresql
 
 import Database.Persist.Sql
 import Database.Persist.Sql.Util (dbIdColumnsEsc)
+import Database.Persist.Sql.Types.Internal (mkPersistBackend)
 import Data.Fixed (Pico)
 
 import qualified Database.PostgreSQL.Simple as PG
@@ -41,7 +45,7 @@ import Control.Monad.Trans.Resource
 import Control.Exception (throw)
 import Control.Monad.IO.Class (MonadIO (..))
 import Data.Data
-import Data.Typeable
+import Data.Typeable (Typeable)
 import Data.IORef
 import qualified Data.Map as Map
 import Data.Maybe
@@ -58,6 +62,7 @@ import qualified Data.IntMap as I
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.Text as T
+import Data.Text.Read (rational)
 import qualified Data.Text.Encoding as T
 import qualified Data.Text.IO as T
 import qualified Blaze.ByteString.Builder       as BB
@@ -73,7 +78,9 @@ import Data.Acquire (Acquire, mkAcquire, with)
 import System.Environment (getEnvironment)
 import Data.Int (Int64)
 import Data.Monoid ((<>))
+import Data.Pool (Pool)
 import Data.Time (utc, localTimeToUTC)
+import Control.Exception (Exception, throwIO)
 
 -- | A @libpq@ connection string.  A simple example of connection
 -- string would be @\"host=localhost port=5432 user=test
@@ -83,19 +90,27 @@ import Data.Time (utc, localTimeToUTC)
 -- for more details on how to create such strings.
 type ConnectionString = ByteString
 
+-- | PostgresServerVersionError exception. This is thrown when persistent
+-- is unable to find the version of the postgreSQL server.
+data PostgresServerVersionError = PostgresServerVersionError String deriving Typeable
+
+instance Show PostgresServerVersionError where
+    show (PostgresServerVersionError uniqueMsg) =
+      "Unexpected PostgreSQL server version, got " <> uniqueMsg
+instance Exception PostgresServerVersionError
 
 -- | Create a PostgreSQL connection pool and run the given
 -- action.  The pool is properly released after the action
 -- finishes using it.  Note that you should not use the given
 -- 'ConnectionPool' outside the action since it may be already
 -- been released.
-withPostgresqlPool :: (MonadBaseControl IO m, MonadLogger m, MonadIO m)
+withPostgresqlPool :: (MonadBaseControl IO m, MonadLogger m, MonadIO m, IsSqlBackend backend)
                    => ConnectionString
                    -- ^ Connection string to the database.
                    -> Int
                    -- ^ Number of connections to be kept open in
                    -- the pool.
-                   -> (ConnectionPool -> m a)
+                   -> (Pool backend -> m a)
                    -- ^ Action to be executed that uses the
                    -- connection pool.
                    -> m a
@@ -106,13 +121,13 @@ withPostgresqlPool ci = withSqlPool $ open' (const $ return ()) ci
 -- responsibility to properly close the connection pool when
 -- unneeded.  Use 'withPostgresqlPool' for an automatic resource
 -- control.
-createPostgresqlPool :: (MonadIO m, MonadBaseControl IO m, MonadLogger m)
+createPostgresqlPool :: (MonadIO m, MonadBaseControl IO m, MonadLogger m, IsSqlBackend backend)
                      => ConnectionString
                      -- ^ Connection string to the database.
                      -> Int
                      -- ^ Number of connections to be kept open
                      -- in the pool.
-                     -> m ConnectionPool
+                     -> m (Pool backend)
 createPostgresqlPool = createPostgresqlPoolModified (const $ return ())
 
 -- | Same as 'createPostgresqlPool', but additionally takes a callback function
@@ -124,36 +139,59 @@ createPostgresqlPool = createPostgresqlPoolModified (const $ return ())
 --
 -- Since 2.1.3
 createPostgresqlPoolModified
-    :: (MonadIO m, MonadBaseControl IO m, MonadLogger m)
+    :: (MonadIO m, MonadBaseControl IO m, MonadLogger m, IsSqlBackend backend)
     => (PG.Connection -> IO ()) -- ^ action to perform after connection is created
     -> ConnectionString -- ^ Connection string to the database.
     -> Int -- ^ Number of connections to be kept open in the pool.
-    -> m ConnectionPool
+    -> m (Pool backend)
 createPostgresqlPoolModified modConn ci = createSqlPool $ open' modConn ci
 
 -- | Same as 'withPostgresqlPool', but instead of opening a pool
 -- of connections, only one connection is opened.
-withPostgresqlConn :: (MonadIO m, MonadBaseControl IO m, MonadLogger m)
-                   => ConnectionString -> (SqlBackend -> m a) -> m a
+withPostgresqlConn :: (MonadIO m, MonadBaseControl IO m, MonadLogger m, IsSqlBackend backend)
+                   => ConnectionString -> (backend -> m a) -> m a
 withPostgresqlConn = withSqlConn . open' (const $ return ())
 
-open' :: (PG.Connection -> IO ())
-      -> ConnectionString -> LogFunc -> IO SqlBackend
+open'
+    :: (IsSqlBackend backend)
+    => (PG.Connection -> IO ()) -> ConnectionString -> LogFunc -> IO backend
 open' modConn cstr logFunc = do
     conn <- PG.connectPostgreSQL cstr
     modConn conn
     openSimpleConn logFunc conn
 
+-- | Gets the PostgreSQL server version
+getServerVersion :: PG.Connection -> IO (Maybe Double)
+getServerVersion conn = do
+  [PG.Only version] <- PG.query_ conn "show server_version";
+  let version' = rational version
+  --- λ> rational "9.8.3"
+  --- Right (9.8,".3")
+  --- λ> rational "9.8.3.5"
+  --- Right (9.8,".3.5")
+  case version' of
+    Right (a,_) -> return $ Just a
+    Left err -> throwIO $ PostgresServerVersionError err
+
+-- | Choose upsert sql generation function based on postgresql version.
+-- PostgreSQL version >= 9.5 supports native upsert feature,
+-- so depending upon that we have to choose how the sql query is generated.
+upsertFunction :: Double -> Maybe (EntityDef -> Text -> Text)
+upsertFunction version = if (version >= 9.5)
+                         then Just upsertSql'
+                         else Nothing
 
 -- | Generate a 'Connection' from a 'PG.Connection'
-openSimpleConn :: LogFunc -> PG.Connection -> IO SqlBackend
+openSimpleConn :: (IsSqlBackend backend) => LogFunc -> PG.Connection -> IO backend
 openSimpleConn logFunc conn = do
     smap <- newIORef $ Map.empty
-    return SqlBackend
+    serverVersion <- getServerVersion conn
+    return . mkPersistBackend $ SqlBackend
         { connPrepare    = prepare' conn
         , connStmtMap    = smap
         , connInsertSql  = insertSql'
         , connInsertManySql = Just insertManySql'
+        , connUpsertSql = maybe Nothing upsertFunction serverVersion
         , connClose      = PG.close conn
         , connMigrateSql = migrate'
         , connBegin      = const $ PG.begin    conn
@@ -194,6 +232,32 @@ insertSql' ent vals =
   in case entityPrimary ent of
        Just _pdef -> ISRManyKeys sql vals
        Nothing -> ISRSingle (sql <> " RETURNING " <> escape (fieldDB (entityId ent)))
+
+
+upsertSql' :: EntityDef -> Text -> Text
+upsertSql' ent updateVal = T.concat
+                           [ "INSERT INTO "
+                           , escape (entityDB ent)
+                           , "("
+                           , T.intercalate "," $ map (escape . fieldDB) $ entityFields ent
+                           , ") VALUES ("
+                           , T.intercalate "," $ map (const "?") (entityFields ent)
+                           , ") ON CONFLICT ("
+                           , T.intercalate "," $ concat $ map (\x -> map escape (map snd $ uniqueFields x)) (entityUniques ent)
+                           , ") DO UPDATE SET "
+                           , updateVal
+                           , " WHERE "
+                           , wher
+                           , " RETURNING ??"
+                           ]
+    where
+      wher = T.intercalate " AND " $ map singleCondition $ entityUniques ent
+
+      singleCondition :: UniqueDef -> Text
+      singleCondition udef = T.intercalate " AND " (map singleClause $ map snd (uniqueFields udef))
+
+      singleClause :: DBName -> Text
+      singleClause field = escape (entityDB ent) <> "." <> (escape field) <> " =?"
 
 -- | SQL for inserting multiple rows at once and returning their primary keys.
 insertManySql' :: EntityDef -> [[PersistValue]] -> InsertSqlResult
@@ -353,8 +417,10 @@ builtinGetters = I.fromList
     , (k PS.xml,         convertPV PersistText)
     , (k PS.float4,      convertPV PersistDouble)
     , (k PS.float8,      convertPV PersistDouble)
+#if !MIN_VERSION_postgresql_simple(0,5,0)
     , (k PS.abstime,     convertPV PersistUTCTime)
     , (k PS.reltime,     convertPV PersistUTCTime)
+#endif
     , (k PS.money,       convertPV PersistRational)
     , (k PS.bpchar,      convertPV PersistText)
     , (k PS.varchar,     convertPV PersistText)
@@ -440,7 +506,8 @@ doesTableExist getter (DBName name) = do
     stmt <- getter sql
     with (stmtQuery stmt vals) ($$ start)
   where
-    sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_name=?"
+    sql = "SELECT COUNT(*) FROM pg_catalog.pg_tables WHERE schemaname != 'pg_catalog'"
+          <> " AND schemaname != 'information_schema' AND tablename=?"
     vals = [PersistText name]
 
     start = await >>= maybe (error "No results when checking doesTableExist") start'
@@ -518,7 +585,7 @@ addTable cols entity = AddTable $ T.concat
                             ]
 
 maySerial :: SqlType -> Maybe Text -> Text
-maySerial SqlInt64 Nothing = " SERIAL "
+maySerial SqlInt64 Nothing = " SERIAL8 "
 maySerial sType _ = " " <> showSqlType sType
 
 mayDefault :: Maybe Text -> Text
@@ -929,18 +996,12 @@ showAlter table (_, DropReference cname) = T.concat
 
 -- | get the SQL string for the table that a PeristEntity represents
 -- Useful for raw SQL queries
-tableName :: forall record.
-          ( PersistEntity record
-          , PersistEntityBackend record ~ SqlBackend
-          ) => record -> Text
+tableName :: (PersistEntity record) => record -> Text
 tableName = escape . tableDBName
 
 -- | get the SQL string for the field that an EntityField represents
 -- Useful for raw SQL queries
-fieldName :: forall record typ.
-          ( PersistEntity record
-          , PersistEntityBackend record ~ SqlBackend
-          ) => EntityField record typ -> Text
+fieldName :: (PersistEntity record) => EntityField record typ -> Text
 fieldName = escape . fieldDBName
 
 escape :: DBName -> Text
@@ -1073,6 +1134,7 @@ mockMigration mig = do
                                                         },
                              connInsertManySql = Nothing,
                              connInsertSql = undefined,
+                             connUpsertSql = Nothing,
                              connStmtMap = smap,
                              connClose = undefined,
                              connMigrateSql = mockMigrate,

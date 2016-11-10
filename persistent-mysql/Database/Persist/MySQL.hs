@@ -1,3 +1,4 @@
+{-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -31,6 +32,7 @@ import Data.Fixed (Pico)
 import Data.Function (on)
 import Data.IORef
 import Data.List (find, intercalate, sort, groupBy)
+import Data.Pool (Pool)
 import Data.Text (Text, pack)
 import qualified Data.Text.IO as T
 import Text.Read (readMaybe)
@@ -46,6 +48,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 
 import Database.Persist.Sql
+import Database.Persist.Sql.Types.Internal (mkPersistBackend)
 import Data.Int (Int64)
 
 import qualified Database.MySQL.Simple        as MySQL
@@ -58,17 +61,16 @@ import qualified Database.MySQL.Base.Types    as MySQLBase
 import Control.Monad.Trans.Control (MonadBaseControl)
 import Control.Monad.Trans.Resource (runResourceT)
 
-
 -- | Create a MySQL connection pool and run the given action.
 -- The pool is properly released after the action finishes using
 -- it.  Note that you should not use the given 'ConnectionPool'
 -- outside the action since it may be already been released.
-withMySQLPool :: (MonadIO m, MonadLogger m, MonadBaseControl IO m) =>
-                 MySQL.ConnectInfo
+withMySQLPool :: (MonadIO m, MonadLogger m, MonadBaseControl IO m, IsSqlBackend backend)
+              => MySQL.ConnectInfo
               -- ^ Connection information.
               -> Int
               -- ^ Number of connections to be kept open in the pool.
-              -> (ConnectionPool -> m a)
+              -> (Pool backend -> m a)
               -- ^ Action to be executed that uses the connection pool.
               -> m a
 withMySQLPool ci = withSqlPool $ open' ci
@@ -77,21 +79,21 @@ withMySQLPool ci = withSqlPool $ open' ci
 -- | Create a MySQL connection pool.  Note that it's your
 -- responsibility to properly close the connection pool when
 -- unneeded.  Use 'withMySQLPool' for automatic resource control.
-createMySQLPool :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) =>
-                   MySQL.ConnectInfo
+createMySQLPool :: (MonadBaseControl IO m, MonadIO m, MonadLogger m, IsSqlBackend backend)
+                => MySQL.ConnectInfo
                 -- ^ Connection information.
                 -> Int
                 -- ^ Number of connections to be kept open in the pool.
-                -> m ConnectionPool
+                -> m (Pool backend)
 createMySQLPool ci = createSqlPool $ open' ci
 
 
 -- | Same as 'withMySQLPool', but instead of opening a pool
 -- of connections, only one connection is opened.
-withMySQLConn :: (MonadBaseControl IO m, MonadIO m, MonadLogger m) =>
-                 MySQL.ConnectInfo
+withMySQLConn :: (MonadBaseControl IO m, MonadIO m, MonadLogger m, IsSqlBackend backend)
+              => MySQL.ConnectInfo
               -- ^ Connection information.
-              -> (SqlBackend -> m a)
+              -> (backend -> m a)
               -- ^ Action to be executed that uses the connection.
               -> m a
 withMySQLConn = withSqlConn . open'
@@ -99,16 +101,17 @@ withMySQLConn = withSqlConn . open'
 
 -- | Internal function that opens a connection to the MySQL
 -- server.
-open' :: MySQL.ConnectInfo -> LogFunc -> IO SqlBackend
+open' :: (IsSqlBackend backend) => MySQL.ConnectInfo -> LogFunc -> IO backend
 open' ci logFunc = do
     conn <- MySQL.connect ci
     MySQLBase.autocommit conn False -- disable autocommit!
     smap <- newIORef $ Map.empty
-    return SqlBackend
+    return . mkPersistBackend $ SqlBackend
         { connPrepare    = prepare' conn
         , connStmtMap    = smap
         , connInsertSql  = insertSql'
         , connInsertManySql = Nothing
+        , connUpsertSql = Nothing
         , connClose      = MySQL.close conn
         , connMigrateSql = migrate' ci
         , connBegin      = const $ MySQL.execute_ conn "start transaction" >> return ()
@@ -230,20 +233,23 @@ convertPV f = (f .) . MySQL.convert
 -- | Get the corresponding @'Getter' 'PersistValue'@ depending on
 -- the type of the column.
 getGetter :: MySQLBase.Field -> Getter PersistValue
-getGetter field = go (MySQLBase.fieldType field) (MySQLBase.fieldCharSet field)
+getGetter field = go (MySQLBase.fieldType field) 
+                        (MySQLBase.fieldLength field)
+                            (MySQLBase.fieldCharSet field)
   where
     -- Bool
-    go MySQLBase.Tiny       _  = convertPV PersistBool
+    go MySQLBase.Tiny       1 _ = convertPV PersistBool
+    go MySQLBase.Tiny       _ _ = convertPV PersistInt64
     -- Int64
-    go MySQLBase.Int24      _  = convertPV PersistInt64
-    go MySQLBase.Short      _  = convertPV PersistInt64
-    go MySQLBase.Long       _  = convertPV PersistInt64
-    go MySQLBase.LongLong   _  = convertPV PersistInt64
+    go MySQLBase.Int24      _ _ = convertPV PersistInt64
+    go MySQLBase.Short      _ _ = convertPV PersistInt64
+    go MySQLBase.Long       _ _ = convertPV PersistInt64
+    go MySQLBase.LongLong   _ _ = convertPV PersistInt64
     -- Double
-    go MySQLBase.Float      _  = convertPV PersistDouble
-    go MySQLBase.Double     _  = convertPV PersistDouble
-    go MySQLBase.Decimal    _  = convertPV PersistDouble
-    go MySQLBase.NewDecimal _  = convertPV PersistDouble
+    go MySQLBase.Float      _ _ = convertPV PersistDouble
+    go MySQLBase.Double     _ _ = convertPV PersistDouble
+    go MySQLBase.Decimal    _ _ = convertPV PersistDouble
+    go MySQLBase.NewDecimal _ _ = convertPV PersistDouble
 
     -- ByteString and Text
 
@@ -251,43 +257,43 @@ getGetter field = go (MySQLBase.fieldType field) (MySQLBase.fieldCharSet field)
     -- (e.g. both BLOB and TEXT have the MySQLBase.Blob type).
     -- Instead, the character set distinguishes them. Binary data uses character set number 63.
     -- See https://dev.mysql.com/doc/refman/5.6/en/c-api-data-structures.html (Search for "63")
-    go MySQLBase.VarChar    63 = convertPV PersistByteString
-    go MySQLBase.VarString  63 = convertPV PersistByteString
-    go MySQLBase.String     63 = convertPV PersistByteString
+    go MySQLBase.VarChar    _ 63 = convertPV PersistByteString
+    go MySQLBase.VarString  _ 63 = convertPV PersistByteString
+    go MySQLBase.String     _ 63 = convertPV PersistByteString
 
-    go MySQLBase.VarChar    _  = convertPV PersistText
-    go MySQLBase.VarString  _  = convertPV PersistText
-    go MySQLBase.String     _  = convertPV PersistText
+    go MySQLBase.VarChar    _ _  = convertPV PersistText
+    go MySQLBase.VarString  _ _  = convertPV PersistText
+    go MySQLBase.String     _ _  = convertPV PersistText
     
-    go MySQLBase.Blob       63 = convertPV PersistByteString
-    go MySQLBase.TinyBlob   63 = convertPV PersistByteString
-    go MySQLBase.MediumBlob 63 = convertPV PersistByteString
-    go MySQLBase.LongBlob   63 = convertPV PersistByteString
+    go MySQLBase.Blob       _ 63 = convertPV PersistByteString
+    go MySQLBase.TinyBlob   _ 63 = convertPV PersistByteString
+    go MySQLBase.MediumBlob _ 63 = convertPV PersistByteString
+    go MySQLBase.LongBlob   _ 63 = convertPV PersistByteString
 
-    go MySQLBase.Blob       _  = convertPV PersistText
-    go MySQLBase.TinyBlob   _  = convertPV PersistText
-    go MySQLBase.MediumBlob _  = convertPV PersistText
-    go MySQLBase.LongBlob   _  = convertPV PersistText
+    go MySQLBase.Blob       _ _  = convertPV PersistText
+    go MySQLBase.TinyBlob   _ _  = convertPV PersistText
+    go MySQLBase.MediumBlob _ _  = convertPV PersistText
+    go MySQLBase.LongBlob   _ _  = convertPV PersistText
 
     -- Time-related
-    go MySQLBase.Time       _  = convertPV PersistTimeOfDay
-    go MySQLBase.DateTime   _  = convertPV PersistUTCTime
-    go MySQLBase.Timestamp  _  = convertPV PersistUTCTime
-    go MySQLBase.Date       _  = convertPV PersistDay
-    go MySQLBase.NewDate    _  = convertPV PersistDay
-    go MySQLBase.Year       _  = convertPV PersistDay
+    go MySQLBase.Time       _ _  = convertPV PersistTimeOfDay
+    go MySQLBase.DateTime   _ _  = convertPV PersistUTCTime
+    go MySQLBase.Timestamp  _ _  = convertPV PersistUTCTime
+    go MySQLBase.Date       _ _  = convertPV PersistDay
+    go MySQLBase.NewDate    _ _  = convertPV PersistDay
+    go MySQLBase.Year       _ _  = convertPV PersistDay
     -- Null
-    go MySQLBase.Null       _  = \_ _ -> PersistNull
+    go MySQLBase.Null       _ _  = \_ _ -> PersistNull
     -- Controversial conversions
-    go MySQLBase.Set        _  = convertPV PersistText
-    go MySQLBase.Enum       _  = convertPV PersistText
+    go MySQLBase.Set        _ _  = convertPV PersistText
+    go MySQLBase.Enum       _ _  = convertPV PersistText
     -- Conversion using PersistDbSpecific
-    go MySQLBase.Geometry   _  = \_ m ->
+    go MySQLBase.Geometry   _ _  = \_ m ->
       case m of
         Just g -> PersistDbSpecific g
         Nothing -> error "Unexpected null in database specific value"
     -- Unsupported
-    go other _ = error $ "MySQL.getGetter: type " ++
+    go other _ _ = error $ "MySQL.getGetter: type " ++
                       show other ++ " not supported."
 
 

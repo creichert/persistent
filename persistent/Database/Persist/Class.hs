@@ -1,15 +1,25 @@
+{-# LANGUAGE ConstraintKinds #-}
+
 module Database.Persist.Class
     ( ToBackendKey (..)
 
     -- * PersistStore
-    , PersistStore (..)
+    , PersistCore (..)
+    , PersistStore
+    , PersistStoreRead (..)
+    , PersistStoreWrite (..)
+    , BaseBackend(..)
+    , PersistRecordBackend
     , getJust
+    , getEntity
     , belongsTo
     , belongsToJust
     , insertEntity
 
     -- * PersistUnique
-    , PersistUnique (..)
+    , PersistUnique
+    , PersistUniqueRead (..)
+    , PersistUniqueWrite (..)
     , getByValue
     , insertBy
     , replaceUnique
@@ -17,7 +27,9 @@ module Database.Persist.Class
     , onlyUnique
 
     -- * PersistQuery
-    , PersistQuery (..)
+    , PersistQuery
+    , PersistQueryRead (..)
+    , PersistQueryWrite (..)
     , selectSource
     , selectKeys
     , selectList
@@ -37,6 +49,7 @@ module Database.Persist.Class
 
     -- * Lifting
     , HasPersistBackend (..)
+    , IsPersistBackend ()
     , liftPersist
 
     -- * JSON utilities
@@ -52,3 +65,16 @@ import Database.Persist.Class.PersistUnique
 import Database.Persist.Class.PersistConfig
 import Database.Persist.Class.PersistField
 import Database.Persist.Class.PersistStore
+
+
+-- | A backwards-compatible alias for those that don't care about distinguishing between read and write queries.
+-- It signifies the assumption that, by default, a backend can write as well as read.
+type PersistUnique a = PersistUniqueWrite a
+
+-- | A backwards-compatible alias for those that don't care about distinguishing between read and write queries.
+-- It signifies the assumption that, by default, a backend can write as well as read.
+type PersistQuery a = PersistQueryWrite a
+
+-- | A backwards-compatible alias for those that don't care about distinguishing between read and write queries.
+-- It signifies the assumption that, by default, a backend can write as well as read.
+type PersistStore a = PersistStoreWrite a

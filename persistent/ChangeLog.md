@@ -1,3 +1,34 @@
+## 2.6.x
+
+* Fix edge case for `\<-. [Nothing]`
+
+## 2.6
+
+* Add `connUpsertSql` type for providing backend-specific upsert sql support.
+
+## 2.5
+
+* read/write typeclass split
+* add insertOrGet convenience function to PersistUnique
+
+## 2.2.4.1
+
+* Documentation updates [#515](https://github.com/yesodweb/persistent/pull/515)
+
+## 2.2.4
+
+* Workaround for side-exiting transformers in `runSqlConn` [#516](https://github.com/yesodweb/persistent/issues/516)
+
+## 2.2.3
+
+* PersistField instance for Natural
+* better oracle support in odbc
+
+## 2.2.2
+
+* Add liftSqlPersistMPool function
+* support http-api-data for url serialization
+
 ## 2.2.1
 
 * Migration failure message with context

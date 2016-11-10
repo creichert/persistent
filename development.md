@@ -1,6 +1,18 @@
-# running persistent tests
+# Running persistent tests using Stack
 
-all tests are ran from the persistent-test directory
+For testing specific package:
+
+    stack test persistent-sqlite
+
+For appropriate backend specific testing using the package `persistent-test`:
+
+    stack test persistent-test --flag persistent-test:<backend>
+
+where <backend> is one of mongodb/postgresql/mysql/couchdb.
+
+# Running persistent tests using Cabal
+
+All tests are ran from the persistent-test directory
 
     cd persistent-test
 

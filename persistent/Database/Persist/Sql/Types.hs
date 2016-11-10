@@ -1,13 +1,21 @@
+{-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE EmptyDataDecls #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE DeriveDataTypeable #-}
-module Database.Persist.Sql.Types where
+module Database.Persist.Sql.Types
+    ( module Database.Persist.Sql.Types
+    , SqlBackend (..), SqlReadBackend (..), SqlWriteBackend (..)
+    , Statement (..), LogFunc, InsertSqlResult (..)
+    , readToUnknown, readToWrite, writeToUnknown
+    , SqlBackendCanRead, SqlBackendCanWrite, SqlReadT, SqlWriteT, IsSqlBackend
+    ) where
 
 import Control.Exception (Exception)
 import Control.Monad.Trans.Resource (ResourceT)
@@ -18,7 +26,7 @@ import Control.Monad.Trans.Reader (ReaderT (..))
 import Control.Monad.Trans.Writer (WriterT)
 import Data.Typeable (Typeable)
 import Database.Persist.Types
-import Database.Persist.Class (HasPersistBackend (..))
+import Database.Persist.Sql.Types.Internal
 import Data.IORef (IORef)
 import Data.Map (Map)
 import Data.Int (Int64)
@@ -29,49 +37,9 @@ import Control.Monad.Logger (LogSource, LogLevel)
 import System.Log.FastLogger (LogStr)
 import Data.Text (Text)
 
-data InsertSqlResult = ISRSingle Text
-                     | ISRInsertGet Text Text
-                     | ISRManyKeys Text [PersistValue]
-
 -- | Deprecated synonym for @SqlBackend@.
 type Connection = SqlBackend
 {-# DEPRECATED Connection "Please use SqlBackend instead" #-}
-
-data SqlBackend = SqlBackend
-    { connPrepare :: Text -> IO Statement
-    -- | table name, column names, id name, either 1 or 2 statements to run
-    , connInsertSql :: EntityDef -> [PersistValue] -> InsertSqlResult
-    , connInsertManySql :: Maybe (EntityDef -> [[PersistValue]] -> InsertSqlResult) -- ^ SQL for inserting many rows and returning their primary keys, for backends that support this functioanlity. If 'Nothing', rows will be inserted one-at-a-time using 'connInsertSql'.
-    , connStmtMap :: IORef (Map Text Statement)
-    , connClose :: IO ()
-    , connMigrateSql
-        :: [EntityDef]
-        -> (Text -> IO Statement)
-        -> EntityDef
-        -> IO (Either [Text] [(Bool, Text)])
-    , connBegin :: (Text -> IO Statement) -> IO ()
-    , connCommit :: (Text -> IO Statement) -> IO ()
-    , connRollback :: (Text -> IO Statement) -> IO ()
-    , connEscapeName :: DBName -> Text
-    , connNoLimit :: Text
-    , connRDBMS :: Text
-    , connLimitOffset :: (Int,Int) -> Bool -> Text -> Text
-    , connLogFunc :: LogFunc
-    }
-    deriving Typeable
-instance HasPersistBackend SqlBackend SqlBackend where
-    persistBackend = id
-
-type LogFunc = Loc -> LogSource -> LogLevel -> LogStr -> IO ()
-
-data Statement = Statement
-    { stmtFinalize :: IO ()
-    , stmtReset :: IO ()
-    , stmtExecute :: [PersistValue] -> IO Int64
-    , stmtQuery :: forall m. MonadIO m
-                => [PersistValue]
-                -> Acquire (Source m [PersistValue])
-    }
 
 data Column = Column
     { cName      :: !DBName
@@ -112,16 +80,8 @@ type ConnectionPool = Pool SqlBackend
 -- some complex @JOIN@ query, or a database-specific command
 -- needs to be issued.
 --
--- To issue raw SQL queries you could use 'R.withStmt', which
--- allows you to do anything you need.  However, its API is
--- /low-level/ and you need to parse each row yourself.  However,
--- most of your complex queries will have simple results -- some
--- of your entities and maybe a couple of derived columns.
---
--- This is where 'rawSql' comes in.  Like 'R.withStmt', you may
--- issue /any/ SQL query.  However, it does all the hard work for
--- you and automatically parses the rows of the result.  It may
--- return:
+-- To issue raw SQL queries, use 'rawSql'. It does all the hard work of
+-- automatically parsing the rows of the result.  It may return:
 --
 --   * An 'Entity', that which 'selectList' returns.
 --     All of your entity's fields are
