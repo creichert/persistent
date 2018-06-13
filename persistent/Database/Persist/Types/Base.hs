@@ -359,6 +359,7 @@ fromPersistValueText (PersistList _) = Left "Cannot convert PersistList to Text"
 fromPersistValueText (PersistMap _) = Left "Cannot convert PersistMap to Text"
 fromPersistValueText (PersistObjectId _) = Left "Cannot convert PersistObjectId to Text"
 fromPersistValueText (PersistDbSpecific _) = Left "Cannot convert PersistDbSpecific to Text. See the documentation of PersistDbSpecific for an example of using a custom database type with Persistent."
+fromPersistValueText (PersistDbSpecificUnescaped _) = Left "Cannot convert PersistDbSpecificUnescaped to Text. See the documentation of PersistDbSpecificUnescaped for an example of using a custom database type with Persistent."
 
 instance A.ToJSON PersistValue where
     toJSON (PersistText t) = A.String $ T.cons 's' t
@@ -380,6 +381,7 @@ instance A.ToJSON PersistValue where
     toJSON (PersistList l) = A.Array $ V.fromList $ map A.toJSON l
     toJSON (PersistMap m) = A.object $ map (second A.toJSON) m
     toJSON (PersistDbSpecific b) = A.String $ T.cons 'p' $ TE.decodeUtf8 $ B64.encode b
+    toJSON (PersistDbSpecificUnescaped b) = A.String $ T.cons 'e' $ TE.decodeUtf8 $ B64.encode b
     toJSON (PersistObjectId o) =
       A.toJSON $ showChar 'o' $ showHexLen 8 (bs2i four) $ showHexLen 16 (bs2i eight) ""
         where
@@ -402,6 +404,8 @@ instance A.FromJSON PersistValue where
         case T.uncons t0 of
             Nothing -> fail "Null string"
             Just ('p', t) -> either (fail "Invalid base64") (return . PersistDbSpecific)
+                           $ B64.decode $ TE.encodeUtf8 t
+            Just ('e', t) -> either (fail "Invalid base64") (return . PersistDbSpecificUnescaped)
                            $ B64.decode $ TE.encodeUtf8 t
             Just ('s', t) -> return $ PersistText t
             Just ('b', t) -> either (fail "Invalid base64") (return . PersistByteString)

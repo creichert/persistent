@@ -435,11 +435,13 @@ data Unknown
   | UnknownUnEscaped ByteString
   deriving (Eq, Show, Read, Ord, Typeable)
 
+unUnknown :: Unknown -> ByteString
 unUnknown (UnknownEscaped bs) = bs
 unUnknown (UnknownUnEscaped bs) = bs
 
 -- | A list of oid's that must be unescaped when
 -- splicing
+unescapedOids :: [LibPQ.Oid]
 unescapedOids = map PS.typoid [
    PS.point
  , PS.polygon
