@@ -1,62 +1,88 @@
+# Building with Backends
+
+With all required backends installed, `stack build` can build all packages
+listed in `stack.yaml` and is equivalent to:
+
+```
+> stack build persistent persistent-template persistent-sqlite persistent-test
+persistent-mongoDB persistent-mysql persistent-postgresql persistent-redis
+```
+
+If backends such as mysql and postgres are not installed then the default build
+will fail as will builds for packages for those backends alone:
+
+```
+> stack build persistent-mysql
+...
+    Process exited with code: ExitFailure 1
+    Configuring mysql-0.1.4...
+    setup: The program 'mysql_config' is required but it could not be found
+    
+> stack build persistent-postgresql
+...
+    Process exited with code: ExitFailure 1
+    Configuring postgresql-libpq-0.9.4.0...
+    setup: The program 'pg_config' is required but it could not be found.
+```
+
+To build all other packages, drop the failing package names as targets:
+
+```
+> stack build persistent persistent-template persistent-sqlite persistent-test
+persistent-mongoDB persistent-redis
+...
+Completed 6 action(s).
+```
+
 # Running persistent tests using Stack
 
 For testing specific package:
 
-    stack test persistent-sqlite
+    > stack test persistent-sqlite
 
 For appropriate backend specific testing using the package `persistent-test`:
 
-    stack test persistent-test --flag persistent-test:<backend>
+    > stack test persistent-test --flag persistent-test:<backend> --exec persistent-test
 
-where <backend> is one of mongodb/postgresql/mysql/couchdb.
+where <backend> is one listed in the cabal file
 
 # Running persistent tests using Cabal
 
 All tests are ran from the persistent-test directory
 
-    cd persistent-test
+    > cd persistent-test
 
 Use cabal
 
-    cabal configure --enable-tests
+    > cabal configure --enable-tests
 
 If you would like to configure tests with a specific backend that can be enabled
 using
 
-    cabal configure -f<backend> --enable-tests
+    > cabal configure -f<backend> --enable-tests
 
 where <backend> is one of mongodb/postgresql/mysql/couchdb.
 
 Now run with
 
-    cabal build && dist/build/test/test
+    > cabal build && dist/build/test/test
 
-
-# Backends
+# Testing Backends
 
 By default the sqlite backend is tested.
 To test other backends, you can give a flag described in persisten-test.
 
-    cabal configure -fmongodb --enable-tests
-
+    > cabal configure -fmongodb --enable-tests
 
 ## Installing backends
 
-You can develop just against your preferred backend and the community should help sort out issues with others.
+For an easy install we recommend running a database from a docker container.
+Lets develop easy entry points for testing a database using a command runner.
 
-However, we have a Dockerfile that you can use to install all the databases.
+    > just --list
+    > just test-mongo
 
-    docker build -t persistent .
-    docker run -d --name postgres postgres:9.3.5
-    docker run --link postgres:postgres --name persistent -v `pwd`:/home/haskell -t -i persistent /bin/bash
-
-This only works on Linux, but you can use Linux on Mac or Windows through Virtualbox.
-
-After building you still need to start up the databases in the background (other than sqlite) that you are testing.
-For example:
-
-    mongod --smallfiles &
-
-Docker does not support upstart so just because you install a database does not mean it will be running. You must launch each one in the background.
-
-If someone can contribute information on how to run persistent or MySQL that would be appreciated.
+[Installing just is easy](https://github.com/casey/just/releases).
+Or you can look in `./bin/` for the commands it will call and run them directly
+Or
+Lets develop a docker-compose file for running different databases.
