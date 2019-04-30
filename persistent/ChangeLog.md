@@ -1,3 +1,28 @@
+# Changelog for persistent
+
+## 2.10.0
+
+* Added two type classes `OnlyOneUniqueKey` and `AtLeastOneUniqueKey`. These classes are used as constraints on functions that expect a certain amount of unique keys. They are defined automatically as part of the `persistent-template`'s generation. [#885](https://github.com/yesodweb/persistent/pull/885)
+* Add the `entityComments` field to the `EntityDef` datatype, and `fieldComments` fields to the `FieldDef` datatype. The QuasiQuoter does not currently know how to add documentation comments to these types, but it can be expanded later. [#865](https://github.com/yesodweb/persistent/pull/865)
+* Expose the `SqlReadT` and `SqlWriteT` constructors. [#887](https://github.com/yesodweb/persistent/pull/887)
+* Remove deprecated `Connection` type synonym. Please use `SqlBackend` instead. [#894](https://github.com/yesodweb/persistent/pull/894)
+* Remove deprecated `SqlPersist` type synonym. Please use `SqlPersistT` instead. [#894](https://github.com/yesodweb/persistent/pull/894)
+* Alter the type of `connUpsertSql` to take a list of unique definitions. This paves the way for more efficient upsert implementations. [#895](https://github.com/yesodweb/persistent/pull/895)
+
+## 2.9.2
+
+* Add documentation for the `Migration` type and some helpers. [#860](https://github.com/yesodweb/persistent/pull/860)
+
+## 2.9.1
+
+* Fix [#847](https://github.com/yesodweb/persistent/issues/847): SQL error with `putMany` on Sqlite when Entity has no unique index.
+
+## 2.9.0
+
+* Added support for SQL isolation levels to via SqlBackend. [#812]
+* Move `Database.Persist.Sql.Raw.QQ` to a separate `persistent-qq` package [#827](https://github.com/yesodweb/persistent/issues/827)
+* Fix [832](https://github.com/yesodweb/persistent/issues/832): `repsertMany` now matches `mapM_ (uncurry repsert)` and is atomic for supported sql back-ends.
+
 ## 2.8.2
 
 * Added support for `sql=` to the unique constraints quasi-quoter so that users can specify the database names of the constraints.

@@ -1,21 +1,19 @@
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE DeriveDataTypeable #-}
-
+{-# LANGUAGE RankNTypes #-}
 module Database.Persist.Sql.Types.Internal
     ( HasPersistBackend (..)
     , IsPersistBackend (..)
-    , SqlReadBackend (unSqlReadBackend)
-    , SqlWriteBackend (unSqlWriteBackend)
+    , SqlReadBackend (..)
+    , SqlWriteBackend (..)
     , readToUnknown
     , readToWrite
     , writeToUnknown
     , LogFunc
     , InsertSqlResult (..)
     , Statement (..)
+    , IsolationLevel (..)
+    , makeIsolationLevelStatement
     , SqlBackend (..)
     , SqlBackendCanRead
     , SqlBackendCanWrite
@@ -24,6 +22,7 @@ module Database.Persist.Sql.Types.Internal
     , IsSqlBackend
     ) where
 
+import Data.List.NonEmpty (NonEmpty(..))
 import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.Logger (LogSource, LogLevel)
 import Control.Monad.Trans.Class (lift)
@@ -33,8 +32,13 @@ import Data.Conduit (ConduitM)
 import Data.Int (Int64)
 import Data.IORef (IORef)
 import Data.Map (Map)
+import Data.Monoid ((<>))
+import Data.String (IsString)
 import Data.Text (Text)
 import Data.Typeable (Typeable)
+import Language.Haskell.TH.Syntax (Loc)
+import System.Log.FastLogger (LogStr)
+
 import Database.Persist.Class
   ( HasPersistBackend (..)
   , PersistQueryRead, PersistQueryWrite
@@ -44,8 +48,6 @@ import Database.Persist.Class
   )
 import Database.Persist.Class.PersistStore (IsPersistBackend (..))
 import Database.Persist.Types
-import Language.Haskell.TH.Syntax (Loc)
-import System.Log.FastLogger (LogStr)
 
 type LogFunc = Loc -> LogSource -> LogLevel -> LogStr -> IO ()
 
@@ -62,12 +64,30 @@ data Statement = Statement
                 -> Acquire (ConduitM () [PersistValue] m ())
     }
 
+-- | Please refer to the documentation for the database in question for a full
+-- overview of the semantics of the varying isloation levels
+data IsolationLevel = ReadUncommitted
+                    | ReadCommitted
+                    | RepeatableRead
+                    | Serializable
+                    deriving (Show, Eq, Enum, Ord, Bounded)
+
+makeIsolationLevelStatement :: (Monoid s, IsString s) => IsolationLevel -> s
+makeIsolationLevelStatement l = "SET TRANSACTION ISOLATION LEVEL " <> case l of
+    ReadUncommitted -> "READ UNCOMMITTED"
+    ReadCommitted -> "READ COMMITTED"
+    RepeatableRead -> "REPEATABLE READ"
+    Serializable -> "SERIALIZABLE"
+
 data SqlBackend = SqlBackend
     { connPrepare :: Text -> IO Statement
     -- | table name, column names, id name, either 1 or 2 statements to run
     , connInsertSql :: EntityDef -> [PersistValue] -> InsertSqlResult
-    , connInsertManySql :: Maybe (EntityDef -> [[PersistValue]] -> InsertSqlResult) -- ^ SQL for inserting many rows and returning their primary keys, for backends that support this functioanlity. If 'Nothing', rows will be inserted one-at-a-time using 'connInsertSql'.
-    , connUpsertSql :: Maybe (EntityDef -> Text -> Text)
+    , connInsertManySql :: Maybe (EntityDef -> [[PersistValue]] -> InsertSqlResult)
+    -- ^ SQL for inserting many rows and returning their primary keys, for
+    -- backends that support this functioanlity. If 'Nothing', rows will be
+    -- inserted one-at-a-time using 'connInsertSql'.
+    , connUpsertSql :: Maybe (EntityDef -> NonEmpty UniqueDef -> Text -> Text)
     -- ^ Some databases support performing UPSERT _and_ RETURN entity
     -- in a single call.
     --
@@ -100,7 +120,7 @@ data SqlBackend = SqlBackend
         -> (Text -> IO Statement)
         -> EntityDef
         -> IO (Either [Text] [(Bool, Text)])
-    , connBegin :: (Text -> IO Statement) -> IO ()
+    , connBegin :: (Text -> IO Statement) -> Maybe IsolationLevel -> IO ()
     , connCommit :: (Text -> IO Statement) -> IO ()
     , connRollback :: (Text -> IO Statement) -> IO ()
     , connEscapeName :: DBName -> Text
@@ -113,6 +133,18 @@ data SqlBackend = SqlBackend
     -- many question-mark parameters may be used in a statement
     --
     -- @since 2.6.1
+    , connRepsertManySql :: Maybe (EntityDef -> Int -> Text)
+    -- ^ Some databases support performing bulk an atomic+bulk INSERT where
+    -- constraint conflicting entities can replace existing entities.
+    --
+    -- This field when set, given
+    -- * an entity definition
+    -- * number of records to be inserted
+    -- should produce a INSERT sql with placeholders for primary+record fields
+    --
+    -- When left as 'Nothing', we default to using 'defaultRepsertMany'.
+    --
+    -- @since 2.9.0
     }
     deriving Typeable
 instance HasPersistBackend SqlBackend where
@@ -122,6 +154,8 @@ instance IsPersistBackend SqlBackend where
     mkPersistBackend = id
 
 -- | An SQL backend which can only handle read queries
+--
+-- The constructor was exposed in 2.10.0.
 newtype SqlReadBackend = SqlReadBackend { unSqlReadBackend :: SqlBackend } deriving Typeable
 instance HasPersistBackend SqlReadBackend where
     type BaseBackend SqlReadBackend = SqlBackend
@@ -130,6 +164,8 @@ instance IsPersistBackend SqlReadBackend where
     mkPersistBackend = SqlReadBackend
 
 -- | An SQL backend which can handle read or write queries
+--
+-- The constructor was exposed in 2.10.0
 newtype SqlWriteBackend = SqlWriteBackend { unSqlWriteBackend :: SqlBackend } deriving Typeable
 instance HasPersistBackend SqlWriteBackend where
     type BaseBackend SqlWriteBackend = SqlBackend

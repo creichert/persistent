@@ -1,11 +1,9 @@
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE CPP #-}
-{-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE FlexibleContexts #-}
 -- | A MySQL backend for @persistent@.
 module Database.Persist.MySQL
     ( withMySQLPool
@@ -21,12 +19,8 @@ module Database.Persist.MySQL
      -- * @ON DUPLICATE KEY UPDATE@ Functionality
     , insertOnDuplicateKeyUpdate
     , insertManyOnDuplicateKeyUpdate
-#if MIN_VERSION_base(4,7,0)
     , HandleUpdateCollision
     , pattern SomeField
-#elif MIN_VERSION_base(4,9,0)
-    , HandleUpdateCollision(SomeField)
-#endif
     , SomeField
     , copyField
     , copyUnlessNull
@@ -34,64 +28,63 @@ module Database.Persist.MySQL
     , copyUnlessEq
     ) where
 
+import qualified Blaze.ByteString.Builder.Char8 as BBB
+import qualified Blaze.ByteString.Builder.ByteString as BBS
+
 import Control.Arrow
-import Control.Monad.Logger (MonadLogger, runNoLoggingT)
+import Control.Monad
 import Control.Monad.IO.Class (MonadIO (..))
+import Control.Monad.IO.Unlift (MonadUnliftIO)
+import Control.Monad.Logger (MonadLogger, runNoLoggingT)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Except (runExceptT)
 import Control.Monad.Trans.Reader (runReaderT, ReaderT)
 import Control.Monad.Trans.Writer (runWriterT)
-import Data.Either (partitionEithers)
-import Data.Monoid ((<>))
-import qualified Data.Monoid as Monoid
+
+import Data.Conduit
+import qualified Data.Conduit.List as CL
+import Data.Acquire (Acquire, mkAcquire, with)
 import Data.Aeson
 import Data.Aeson.Types (modifyFailure)
 import Data.ByteString (ByteString)
+import Data.Either (partitionEithers)
 import Data.Fixed (Pico)
 import Data.Function (on)
+import Data.Int (Int64)
 import Data.IORef
 import Data.List (find, intercalate, sort, groupBy)
+import qualified Data.Map as Map
+import Data.Monoid ((<>))
+import qualified Data.Monoid as Monoid
 import Data.Pool (Pool)
 import Data.Text (Text, pack)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 import qualified Data.Text.IO as T
 import Text.Read (readMaybe)
 import System.Environment (getEnvironment)
-import Data.Acquire (Acquire, mkAcquire, with)
-
-import Data.Conduit
-import qualified Blaze.ByteString.Builder.Char8 as BBB
-import qualified Blaze.ByteString.Builder.ByteString as BBS
-import qualified Data.Conduit.List as CL
-import qualified Data.Map as Map
-import qualified Data.Text as T
-import qualified Data.Text.Encoding as T
 
 import Database.Persist.Sql
-import Database.Persist.Sql.Types.Internal (mkPersistBackend)
-import Database.Persist.Sql.Util (commaSeparated, mkUpdateText', parenWrapped)
-import Data.Int (Int64)
+import Database.Persist.Sql.Types.Internal (makeIsolationLevelStatement)
+import qualified Database.Persist.Sql.Util as Util
 
+import qualified Database.MySQL.Base          as MySQLBase
+import qualified Database.MySQL.Base.Types    as MySQLBase
 import qualified Database.MySQL.Simple        as MySQL
 import qualified Database.MySQL.Simple.Param  as MySQL
 import qualified Database.MySQL.Simple.Result as MySQL
 import qualified Database.MySQL.Simple.Types  as MySQL
 
-import qualified Database.MySQL.Base          as MySQLBase
-import qualified Database.MySQL.Base.Types    as MySQLBase
-import Control.Monad.IO.Unlift (MonadUnliftIO)
-
-import Prelude
-
 -- | Create a MySQL connection pool and run the given action.
 -- The pool is properly released after the action finishes using
 -- it.  Note that you should not use the given 'ConnectionPool'
 -- outside the action since it may be already been released.
-withMySQLPool :: (MonadLogger m, MonadUnliftIO m, IsSqlBackend backend)
+withMySQLPool :: (MonadLogger m, MonadUnliftIO m)
               => MySQL.ConnectInfo
               -- ^ Connection information.
               -> Int
               -- ^ Number of connections to be kept open in the pool.
-              -> (Pool backend -> m a)
+              -> (Pool SqlBackend -> m a)
               -- ^ Action to be executed that uses the connection pool.
               -> m a
 withMySQLPool ci = withSqlPool $ open' ci
@@ -100,21 +93,21 @@ withMySQLPool ci = withSqlPool $ open' ci
 -- | Create a MySQL connection pool.  Note that it's your
 -- responsibility to properly close the connection pool when
 -- unneeded.  Use 'withMySQLPool' for automatic resource control.
-createMySQLPool :: (MonadUnliftIO m, MonadLogger m, IsSqlBackend backend)
+createMySQLPool :: (MonadUnliftIO m, MonadLogger m)
                 => MySQL.ConnectInfo
                 -- ^ Connection information.
                 -> Int
                 -- ^ Number of connections to be kept open in the pool.
-                -> m (Pool backend)
+                -> m (Pool SqlBackend)
 createMySQLPool ci = createSqlPool $ open' ci
 
 
 -- | Same as 'withMySQLPool', but instead of opening a pool
 -- of connections, only one connection is opened.
-withMySQLConn :: (MonadUnliftIO m, MonadLogger m, IsSqlBackend backend)
+withMySQLConn :: (MonadUnliftIO m, MonadLogger m)
               => MySQL.ConnectInfo
               -- ^ Connection information.
-              -> (backend -> m a)
+              -> (SqlBackend -> m a)
               -- ^ Action to be executed that uses the connection.
               -> m a
 withMySQLConn = withSqlConn . open'
@@ -122,12 +115,12 @@ withMySQLConn = withSqlConn . open'
 
 -- | Internal function that opens a connection to the MySQL
 -- server.
-open' :: (IsSqlBackend backend) => MySQL.ConnectInfo -> LogFunc -> IO backend
+open' :: MySQL.ConnectInfo -> LogFunc -> IO SqlBackend
 open' ci logFunc = do
     conn <- MySQL.connect ci
     MySQLBase.autocommit conn False -- disable autocommit!
     smap <- newIORef $ Map.empty
-    return . mkPersistBackend $ SqlBackend
+    return $ SqlBackend
         { connPrepare    = prepare' conn
         , connStmtMap    = smap
         , connInsertSql  = insertSql'
@@ -136,7 +129,9 @@ open' ci logFunc = do
         , connPutManySql = Just putManySql
         , connClose      = MySQL.close conn
         , connMigrateSql = migrate' ci
-        , connBegin      = const $ MySQL.execute_ conn "start transaction" >> return ()
+        , connBegin      = \_ mIsolation -> do
+            forM_ mIsolation $ \iso -> MySQL.execute_ conn (makeIsolationLevelStatement iso)
+            MySQL.execute_ conn "start transaction" >> return ()
         , connCommit     = const $ MySQL.commit   conn
         , connRollback   = const $ MySQL.rollback conn
         , connEscapeName = pack . escapeDBName
@@ -147,6 +142,7 @@ open' ci logFunc = do
         , connLimitOffset = decorateSQLWithLimitOffset "LIMIT 18446744073709551615"
         , connLogFunc    = logFunc
         , connMaxParams = Nothing
+        , connRepsertManySql = Just repsertManySql
         }
 
 -- | Prepare a query.  We don't support prepared statements, but
@@ -241,6 +237,7 @@ instance MySQL.Param P where
       MySQL.Plain $ BBB.fromString $ show (fromRational r :: Pico)
       -- FIXME: Too Ambigous, can not select precision without information about field
     render (P (PersistDbSpecific s))    = MySQL.Plain $ BBS.fromByteString s
+    render (P (PersistArray a))       = MySQL.render (P (PersistList a))
     render (P (PersistObjectId _))    =
         error "Refusing to serialize a PersistObjectId to a MySQL value"
 
@@ -573,7 +570,7 @@ getColumn connectInfo getter tname [ PersistText cname
                     _ -> fail $ "Invalid default column: " ++ show default'
 
       -- Foreign key (if any)
-      stmt <- lift . getter $ T.concat 
+      stmt <- lift . getter $ T.concat
         [ "SELECT REFERENCED_TABLE_NAME, "
         ,   "CONSTRAINT_NAME, "
         ,   "ORDINAL_POSITION "
@@ -892,6 +889,8 @@ refName (DBName table) (DBName column) =
 
 ----------------------------------------------------------------------
 
+escape :: DBName -> Text
+escape = T.pack . escapeDBName
 
 -- | Escape a database name to be included on a query.
 escapeDBName :: DBName -> String
@@ -1041,7 +1040,9 @@ mockMigration mig = do
                              connLogFunc = undefined,
                              connUpsertSql = undefined,
                              connPutManySql = undefined,
-                             connMaxParams = Nothing}
+                             connMaxParams = Nothing,
+                             connRepsertManySql = Nothing
+                             }
       result = runReaderT . runWriterT . runWriterT $ mig
   resp <- result sqlbackend
   mapM_ T.putStrLn $ map snd $ snd resp
@@ -1067,7 +1068,7 @@ insertOnDuplicateKeyUpdate record =
 -- @INSERT ... ON DUPLICATE KEY UPDATE@ functionality, exposed via
 -- 'insertManyOnDuplicateKeyUpdate' in this library.
 --
--- @since 3.0.0
+-- @since 2.8.0
 data HandleUpdateCollision record where
   -- | Copy the field directly from the record.
   CopyField :: EntityField record typ -> HandleUpdateCollision record
@@ -1081,9 +1082,7 @@ data HandleUpdateCollision record where
 -- @since 2.6.2
 type SomeField = HandleUpdateCollision
 
-#if MIN_VERSION_base(4,8,0)
 pattern SomeField :: EntityField record typ -> SomeField record
-#endif
 pattern SomeField x = CopyField x
 {-# DEPRECATED SomeField "The type SomeField is deprecated. Use the type HandleUpdateCollision instead, and use the function copyField instead of the data constructor." #-}
 
@@ -1252,7 +1251,7 @@ mkBulkInsertQuery records fieldValues updates =
     tableName = T.pack . escapeDBName . entityDB $ entityDef'
     copyUnlessValues = map snd fieldsToMaybeCopy
     recordValues = concatMap (map toPersistValue . toPersistFields) records
-    recordPlaceholders = commaSeparated $ map (parenWrapped . commaSeparated . map (const "?") . toPersistFields) records
+    recordPlaceholders = Util.commaSeparated $ map (Util.parenWrapped . Util.commaSeparated . map (const "?") . toPersistFields) records
     mkCondFieldSet n _ = T.concat
         [ n
         , "=COALESCE("
@@ -1265,16 +1264,16 @@ mkBulkInsertQuery records fieldValues updates =
         ]
     condFieldSets = map (uncurry mkCondFieldSet) fieldsToMaybeCopy
     fieldSets = map (\n -> T.concat [n, "=VALUES(", n, ")"]) updateFieldNames
-    upds = map (mkUpdateText' (pack . escapeDBName) id) updates
+    upds = map (Util.mkUpdateText' (pack . escapeDBName) id) updates
     updsValues = map (\(Update _ val _) -> toPersistValue val) updates
     updateText = case fieldSets <> upds <> condFieldSets of
         [] -> T.concat [firstField, "=", firstField]
-        xs -> commaSeparated xs
+        xs -> Util.commaSeparated xs
     q = T.concat
         [ "INSERT INTO "
         , tableName
         , " ("
-        , commaSeparated entityFieldNames
+        , Util.commaSeparated entityFieldNames
         , ") "
         , " VALUES "
         , recordPlaceholders
@@ -1283,25 +1282,33 @@ mkBulkInsertQuery records fieldValues updates =
         ]
 
 putManySql :: EntityDef -> Int -> Text
-putManySql entityDef' numRecords
-  | numRecords > 0 = q
-  | otherwise = error "putManySql: numRecords MUST be greater than 0!"
+putManySql ent n = putManySql' fields ent n
   where
-    tableName = T.pack . escapeDBName . entityDB $ entityDef'
-    fieldDbToText = T.pack . escapeDBName . fieldDB
-    entityFieldNames = map fieldDbToText (entityFields entityDef')
-    recordPlaceholders= parenWrapped . commaSeparated
-                      $ map (const "?") (entityFields entityDef')
-    mkAssignment n = T.concat [n, "=VALUES(", n, ")"]
-    fieldSets = map (mkAssignment . fieldDbToText) (entityFields entityDef')
+    fields = entityFields ent
+
+repsertManySql :: EntityDef -> Int -> Text
+repsertManySql ent n = putManySql' fields ent n
+  where
+    fields = keyAndEntityFields ent
+
+putManySql' :: [FieldDef] -> EntityDef -> Int -> Text
+putManySql' fields ent n = q
+  where
+    fieldDbToText = escape . fieldDB
+    mkAssignment f = T.concat [f, "=VALUES(", f, ")"]
+
+    table = escape . entityDB $ ent
+    columns = Util.commaSeparated $ map fieldDbToText fields
+    placeholders = map (const "?") fields
+    updates = map (mkAssignment . fieldDbToText) fields
+
     q = T.concat
         [ "INSERT INTO "
-        , tableName
-        , " ("
-        , commaSeparated entityFieldNames
-        , ") "
+        , table
+        , Util.parenWrapped columns
         , " VALUES "
-        , commaSeparated (replicate numRecords recordPlaceholders)
+        , Util.commaSeparated . replicate n
+            . Util.parenWrapped . Util.commaSeparated $ placeholders
         , " ON DUPLICATE KEY UPDATE "
-        , commaSeparated fieldSets
+        , Util.commaSeparated updates
         ]

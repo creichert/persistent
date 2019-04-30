@@ -1,34 +1,34 @@
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE LambdaCase #-}
+
 {-# OPTIONS_GHC -fno-warn-orphans #-}
+
 module Database.Persist.Sql.Orphan.PersistQuery
     ( deleteWhereCount
     , updateWhereCount
     , decorateSQLWithLimitOffset
     ) where
 
+import Control.Exception (throwIO)
+import Control.Monad.IO.Class
+import Control.Monad.Trans.Reader (ReaderT, ask, withReaderT)
+import Data.ByteString.Char8 (readInteger)
+import Data.Conduit
+import qualified Data.Conduit.List as CL
+import Data.Int (Int64)
+import Data.List (transpose, inits, find)
+import Data.Maybe (isJust)
+import Data.Monoid (Monoid (..), (<>))
+import qualified Data.Text as T
+import Data.Text (Text)
+
 import Database.Persist hiding (updateField)
 import Database.Persist.Sql.Util (
     entityColumnNames, parseEntityValues, isIdField, updatePersistValue
-  , mkUpdateText, commaSeparated)
+  , mkUpdateText, commaSeparated, dbIdColumns)
 import Database.Persist.Sql.Types
 import Database.Persist.Sql.Raw
 import Database.Persist.Sql.Orphan.PersistStore (withRawQuery)
-import Database.Persist.Sql.Util (dbIdColumns)
-import qualified Data.Text as T
-import Data.Text (Text)
-import Data.Monoid (Monoid (..), (<>))
-import Data.Int (Int64)
-import Control.Monad.IO.Class
-import Control.Monad.Trans.Reader (ReaderT, ask, withReaderT)
-import Control.Exception (throwIO)
-import qualified Data.Conduit.List as CL
-import Data.Conduit
-import Data.ByteString.Char8 (readInteger)
-import Data.Maybe (isJust)
-import Data.List (transpose, inits, find)
 
 -- orphaned instance for convenience of modularity
 instance PersistQueryRead SqlBackend where
@@ -148,10 +148,10 @@ instance PersistQueryWrite SqlWriteBackend where
 -- | Same as 'deleteWhere', but returns the number of rows affected.
 --
 -- @since 1.1.5
-deleteWhereCount :: (PersistEntity val, MonadIO m, PersistEntityBackend val ~ SqlBackend, IsSqlBackend backend)
+deleteWhereCount :: (PersistEntity val, MonadIO m, PersistEntityBackend val ~ SqlBackend, BackendCompatible SqlBackend backend)
                  => [Filter val]
                  -> ReaderT backend m Int64
-deleteWhereCount filts = withReaderT persistBackend $ do
+deleteWhereCount filts = withReaderT projectBackend $ do
     conn <- ask
     let t = entityDef $ dummyFromFilts filts
     let wher = if null filts
@@ -167,12 +167,12 @@ deleteWhereCount filts = withReaderT persistBackend $ do
 -- | Same as 'updateWhere', but returns the number of rows affected.
 --
 -- @since 1.1.5
-updateWhereCount :: (PersistEntity val, MonadIO m, SqlBackend ~ PersistEntityBackend val, IsSqlBackend backend)
+updateWhereCount :: (PersistEntity val, MonadIO m, SqlBackend ~ PersistEntityBackend val, BackendCompatible SqlBackend backend)
                  => [Filter val]
                  -> [Update val]
                  -> ReaderT backend m Int64
 updateWhereCount _ [] = return 0
-updateWhereCount filts upds = withReaderT persistBackend $ do
+updateWhereCount filts upds = withReaderT projectBackend $ do
     conn <- ask
     let wher = if null filts
                 then ""
@@ -190,7 +190,7 @@ updateWhereCount filts upds = withReaderT persistBackend $ do
   where
     t = entityDef $ dummyFromFilts filts
 
-fieldName ::  forall record typ.  (PersistEntity record, PersistEntityBackend record ~ SqlBackend) => EntityField record typ -> DBName
+fieldName ::  forall record typ. (PersistEntity record, PersistEntityBackend record ~ SqlBackend) => EntityField record typ -> DBName
 fieldName f = fieldDB $ persistFieldDef f
 
 dummyFromFilts :: [Filter v] -> Maybe v
@@ -321,15 +321,18 @@ filterClauseHelper includeTable includeWhere conn orNull filters =
         fromPersistList (PersistList xs) = xs
         fromPersistList other = error $ "expected PersistList but found " ++ show other
 
-        filterValueToPersistValues :: forall a.  PersistField a => Either a [a] -> [PersistValue]
-        filterValueToPersistValues v = map toPersistValue $ either return id v
+        filterValueToPersistValues :: forall a.  PersistField a => FilterValue a -> [PersistValue]
+        filterValueToPersistValues = \case
+            FilterValue a -> [toPersistValue a]
+            FilterValues as -> toPersistValue <$> as
+            UnsafeValue x -> [toPersistValue x]
 
         orNullSuffix =
             case orNull of
                 OrNullYes -> mconcat [" OR ", name, " IS NULL"]
                 OrNullNo -> ""
 
-        isNull = any (== PersistNull) allVals
+        isNull = PersistNull `elem` allVals
         notNullVals = filter (/= PersistNull) allVals
         allVals = filterValueToPersistValues value
         tn = connEscapeName conn $ entityDB
@@ -340,10 +343,14 @@ filterClauseHelper includeTable includeWhere conn orNull filters =
                 else id)
             $ connEscapeName conn $ fieldName field
         qmarks = case value of
-                    Left _ -> "?"
-                    Right x ->
-                        let x' = filter (/= PersistNull) $ map toPersistValue x
-                         in "(" <> T.intercalate "," (map (const "?") x') <> ")"
+                    FilterValue{} -> "?"
+                    UnsafeValue{} -> "?"
+                    FilterValues xs ->
+                        let parens a = "(" <> a <> ")"
+                            commas = T.intercalate ","
+                            toQs = fmap $ const "?"
+                            nonNulls = filter (/= PersistNull) $ map toPersistValue xs
+                         in parens . commas . toQs $ nonNulls
         showSqlFilter Eq = "="
         showSqlFilter Ne = "<>"
         showSqlFilter Gt = ">"

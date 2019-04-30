@@ -1,3 +1,12 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 -- | Use persistent-mongodb the same way you would use other persistent
 -- libraries and refer to the general persistent documentation.
 -- There are some new MongoDB specific filters under the filters section.
@@ -13,21 +22,12 @@
 -- The MongoDB Persistent backend does not help perform migrations.
 -- Unlike SQL backends, uniqueness constraints cannot be created for you.
 -- You must place a unique index on unique fields.
-{-# LANGUAGE CPP, PackageImports, OverloadedStrings, ScopedTypeVariables  #-}
-{-# LANGUAGE DeriveDataTypeable, GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE MultiParamTypeClasses, TypeSynonymInstances, FlexibleInstances, FlexibleContexts #-}
-{-# LANGUAGE RankNTypes, TypeFamilies #-}
-{-# LANGUAGE EmptyDataDecls #-}
-
-{-# OPTIONS_GHC -fno-warn-orphans #-}
-{-# LANGUAGE GADTs #-}
 module Database.Persist.MongoDB
     (
     -- * Entity conversion
       collectionName
     , docToEntityEither
     , docToEntityThrow
-    , entityToDocument
     , recordToDocument
     , documentFromEntity
     , toInsertDoc
@@ -42,7 +42,7 @@ module Database.Persist.MongoDB
     -- ** Filters
     -- $filters
     , nestEq, nestNe, nestGe, nestLe, nestIn, nestNotIn
-    , anyEq, nestAnyEq, nestBsonEq, anyBsonEq, multiBsonEq
+    , anyEq, nestAnyEq, nestBsonEq, anyBsonEq
     , inList, ninList
     , (=~.)
     -- non-operator forms of filters
@@ -111,67 +111,51 @@ module Database.Persist.MongoDB
     , module Database.Persist
     ) where
 
-import Database.Persist
-import qualified Database.Persist.Sql as Sql
-
-import qualified Control.Monad.IO.Class as Trans
 import Control.Exception (throw, throwIO)
-import Data.Acquire (mkAcquire)
-import qualified Data.Traversable as Traversable
-
-import Data.Bson (ObjectId(..))
-import qualified Database.MongoDB as DB
-import Database.MongoDB.Query (Database)
-import Control.Applicative as A (Applicative, (<$>))
-import Network (PortID (PortNumber))
-import Network.Socket (HostName)
-import Data.Maybe (mapMaybe, fromJust)
-import qualified Data.Text as T
-import Data.Text (Text)
-import qualified Data.ByteString as BS
-import qualified Data.Text.Encoding as E
-import qualified Data.Serialize as Serialize
-import Web.PathPieces (PathPiece(..))
-import Web.HttpApiData (ToHttpApiData(..), FromHttpApiData(..), parseUrlPieceMaybe, parseUrlPieceWithPrefix, readTextData)
-import Data.Conduit
+import Control.Monad (liftM, (>=>), forM_, unless)
 import Control.Monad.IO.Class (liftIO)
+import qualified Control.Monad.IO.Class as Trans
+import Control.Monad.IO.Unlift (MonadUnliftIO, withRunInIO)
+import Control.Monad.Trans.Reader (ask, runReaderT)
+
+import Data.Acquire (mkAcquire)
 import Data.Aeson (Value (Number), (.:), (.:?), (.!=), FromJSON(..), ToJSON(..), withText, withObject)
 import Data.Aeson.Types (modifyFailure)
-import Control.Monad (liftM, (>=>), forM_, unless)
+import Data.Bits (shiftR)
+import Data.Bson (ObjectId(..))
+import qualified Data.ByteString as BS
+import Data.Conduit
+import Data.Maybe (mapMaybe, fromJust)
+import Data.Monoid (mappend)
+import qualified Data.Serialize as Serialize
+import Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as E
+import qualified Data.Traversable as Traversable
 import qualified Data.Pool as Pool
 import Data.Time (NominalDiffTime)
+import Data.Time.Calendar (Day(..))
 #ifdef HIGH_PRECISION_DATE
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 #endif
-import Data.Time.Calendar (Day(..))
-#if MIN_VERSION_aeson(0, 7, 0)
-#else
-import Data.Attoparsec.Number
-#endif
-import Data.Bits (shiftR)
 import Data.Word (Word16)
-import Data.Monoid (mappend)
-import Control.Monad.Trans.Reader (ask, runReaderT)
-import Control.Monad.IO.Unlift (MonadUnliftIO, withRunInIO)
+import Network (PortID (PortNumber))
+import Network.Socket (HostName)
 import Numeric (readHex)
-import Unsafe.Coerce (unsafeCoerce)
-
-#if MIN_VERSION_base(4,6,0)
 import System.Environment (lookupEnv)
-#else
-import System.Environment (getEnvironment)
-#endif
+import Unsafe.Coerce (unsafeCoerce)
+import Web.PathPieces (PathPiece(..))
+import Web.HttpApiData (ToHttpApiData(..), FromHttpApiData(..), parseUrlPieceMaybe, parseUrlPieceWithPrefix, readTextData)
 
 #ifdef DEBUG
 import FileLocation (debug)
 #endif
 
-#if !MIN_VERSION_base(4,6,0)
-lookupEnv :: String -> IO (Maybe String)
-lookupEnv key = do
-    env <- getEnvironment
-    return $ lookup key env
-#endif
+import qualified Database.MongoDB as DB
+import Database.MongoDB.Query (Database)
+
+import Database.Persist
+import qualified Database.Persist.Sql as Sql
 
 instance HasPersistBackend DB.MongoContext where
     type BaseBackend DB.MongoContext = DB.MongoContext
@@ -184,30 +168,16 @@ newtype NoOrphanNominalDiffTime = NoOrphanNominalDiffTime NominalDiffTime
                                 deriving (Show, Eq, Num)
 
 instance FromJSON NoOrphanNominalDiffTime where
-#if MIN_VERSION_aeson(0, 7, 0)
     parseJSON (Number x) = (return . NoOrphanNominalDiffTime . fromRational . toRational) x
-
-
-#else
-    parseJSON (Number (I x)) = (return . NoOrphanNominalDiffTime . fromInteger) x
-    parseJSON (Number (D x)) = (return . NoOrphanNominalDiffTime . fromRational . toRational) x
-
-#endif
     parseJSON _ = fail "couldn't parse diff time"
 
 newtype NoOrphanPortID = NoOrphanPortID PortID deriving (Show, Eq)
 
 
 instance FromJSON NoOrphanPortID where
-#if MIN_VERSION_aeson(0, 7, 0)
     parseJSON (Number  x) = (return . NoOrphanPortID . PortNumber . fromIntegral ) cnvX
       where cnvX :: Word16
             cnvX = round x
-
-#else
-    parseJSON (Number (I x)) = (return . NoOrphanPortID . PortNumber . fromInteger) x
-
-#endif
     parseJSON _ = fail "couldn't parse port number"
 
 
@@ -220,7 +190,7 @@ instance ToHttpApiData (BackendKey DB.MongoContext) where
 instance FromHttpApiData (BackendKey DB.MongoContext) where
     parseUrlPiece input = do
       s <- parseUrlPieceWithPrefix "o" input <!> return input
-      MongoKey A.<$> readTextData s
+      MongoKey <$> readTextData s
       where
         infixl 3 <!>
         Left _ <!> y = y
@@ -257,13 +227,13 @@ instance Sql.PersistFieldSql (BackendKey DB.MongoContext) where
     sqlType _ = Sql.SqlOther "doesn't make much sense for MongoDB"
 
 
-withConnection :: (Trans.MonadIO m, A.Applicative m)
+withConnection :: (Trans.MonadIO m)
                => MongoConf
                -> (ConnectionPool -> m b) -> m b
 withConnection mc =
   withMongoDBPool (mgDatabase mc) (T.unpack $ mgHost mc) (mgPort mc) (mgAuth mc) (mgPoolStripes mc) (mgStripeConnections mc) (mgConnectionIdleTime mc)
 
-withMongoDBConn :: (Trans.MonadIO m, Applicative m)
+withMongoDBConn :: (Trans.MonadIO m)
                 => Database -> HostName -> PortID
                 -> Maybe MongoAuth -> NominalDiffTime
                 -> (ConnectionPool -> m b) -> m b
@@ -278,7 +248,7 @@ createReplicatSet rsSeed dbname mAuth = do
     testAccess pipe dbname mAuth
     return $ Connection pipe dbname
 
-createRsPool :: (Trans.MonadIO m, Applicative m) => Database -> ReplicaSetConfig
+createRsPool :: (Trans.MonadIO m) => Database -> ReplicaSetConfig
               -> Maybe MongoAuth
               -> Int -- ^ pool size (number of stripes)
               -> Int -- ^ stripe size (number of connections per stripe)
@@ -305,7 +275,7 @@ createConnection dbname hostname port mAuth = do
     testAccess pipe dbname mAuth
     return $ Connection pipe dbname
 
-createMongoDBPool :: (Trans.MonadIO m, Applicative m) => Database -> HostName -> PortID
+createMongoDBPool :: (Trans.MonadIO m) => Database -> HostName -> PortID
                   -> Maybe MongoAuth
                   -> Int -- ^ pool size (number of stripes)
                   -> Int -- ^ stripe size (number of connections per stripe)
@@ -320,7 +290,7 @@ createMongoDBPool dbname hostname port mAuth connectionPoolSize stripeSize conne
                           stripeSize
 
 
-createMongoPool :: (Trans.MonadIO m, Applicative m) => MongoConf -> m ConnectionPool
+createMongoPool :: (Trans.MonadIO m) => MongoConf -> m ConnectionPool
 createMongoPool c@MongoConf{mgReplicaSetConfig = Just (ReplicaSetConfig rsName hosts)} =
       createRsPool
          (mgDatabase c)
@@ -339,7 +309,7 @@ type PipePool = Pool.Pool DB.Pipe
 -- The database parameter has not yet been applied yet.
 -- This is useful for switching between databases (on the same host and port)
 -- Unlike the normal pool, no authentication is available
-createMongoDBPipePool :: (Trans.MonadIO m, Applicative m) => HostName -> PortID
+createMongoDBPipePool :: (Trans.MonadIO m) => HostName -> PortID
                   -> Int -- ^ pool size (number of stripes)
                   -> Int -- ^ stripe size (number of connections per stripe)
                   -> NominalDiffTime -- ^ time a connection is left idle before closing
@@ -352,10 +322,10 @@ createMongoDBPipePool hostname port connectionPoolSize stripeSize connectionIdle
                           connectionIdleTime
                           stripeSize
 
-withMongoPool :: (Trans.MonadIO m, Applicative m) => MongoConf -> (ConnectionPool -> m b) -> m b
+withMongoPool :: (Trans.MonadIO m) => MongoConf -> (ConnectionPool -> m b) -> m b
 withMongoPool conf connectionReader = createMongoPool conf >>= connectionReader
 
-withMongoDBPool :: (Trans.MonadIO m, Applicative m) =>
+withMongoDBPool :: (Trans.MonadIO m) =>
   Database -> HostName -> PortID -> Maybe MongoAuth -> Int -> Int -> NominalDiffTime -> (ConnectionPool -> m b) -> m b
 withMongoDBPool dbname hostname port mauth poolStripes stripeConnections connectionIdleTime connectionReader = do
   pool <- createMongoDBPool dbname hostname port mauth poolStripes stripeConnections connectionIdleTime
@@ -443,7 +413,7 @@ toUniquesDoc uniq = zipWith (DB.:=)
 
 -- | convert a PersistEntity into document fields.
 -- for inserts only: nulls are ignored so they will be unset in the document.
--- 'entityToDocument' includes nulls
+-- 'recordToDocument' includes nulls
 toInsertDoc :: forall record.  (PersistEntity record, PersistEntityBackend record ~ DB.MongoContext)
             => record -> DB.Document
 toInsertDoc record = zipFilter (embeddedFields $ toEmbedEntityDef entDef)
@@ -488,15 +458,10 @@ recordToDocument record = zipToDoc (map fieldDB $ entityFields entity) (toPersis
   where
     entity = entityDef $ Just record
 
-entityToDocument :: (PersistEntity record, PersistEntityBackend record ~ DB.MongoContext)
-                 => record -> DB.Document
-entityToDocument = recordToDocument
-{-# DEPRECATED entityToDocument "use recordToDocument" #-}
-
 documentFromEntity :: (PersistEntity record, PersistEntityBackend record ~ DB.MongoContext)
                    => Entity record -> DB.Document
 documentFromEntity (Entity key record) =
-    keyToMongoDoc key ++ entityToDocument record
+    keyToMongoDoc key ++ recordToDocument record
 
 zipToDoc :: PersistField a => [DBName] -> [a] -> [DB.Field]
 zipToDoc [] _  = []
@@ -638,7 +603,7 @@ instance PersistUniqueWrite DB.MongoContext where
 
     upsertBy uniq newRecord upds = do
         let uniqueDoc = toUniquesDoc uniq :: [DB.Field]
-        let uniqKeys = map DB.label uniqueDoc :: [DB.Label]   
+        let uniqKeys = map DB.label uniqueDoc :: [DB.Label]
         let insDoc = DB.exclude uniqKeys $ toInsertDoc newRecord :: DB.Document
         let selection = DB.select uniqueDoc $ collectionName newRecord :: DB.Selection
         mdoc <- getBy uniq
@@ -844,7 +809,7 @@ andDollar = "$and"
 
 filterToBSON :: forall a. ( PersistField a)
              => Text
-             -> Either a [a]
+             -> FilterValue a
              -> PersistFilter
              -> DB.Field
 filterToBSON fname v filt = case filt of
@@ -918,11 +883,12 @@ nestedFieldName = T.intercalate "." . nesFldName
     nesFldName (nf1 `LastNestFld` nf2)         = [fieldName nf1, fieldName nf2]
     nesFldName (nf1 `LastNestFldNullable` nf2) = [fieldName nf1, fieldName nf2]
 
-toValue :: forall a.  PersistField a => Either a [a] -> DB.Value
+toValue :: forall a.  PersistField a => FilterValue a -> DB.Value
 toValue val =
     case val of
-      Left v   -> DB.val $ toPersistValue v
-      Right vs -> DB.val $ map toPersistValue vs
+      FilterValue v   -> DB.val $ toPersistValue v
+      UnsafeValue v   -> DB.val $ toPersistValue v
+      FilterValues vs -> DB.val $ map toPersistValue vs
 
 fieldName ::  forall record typ.  (PersistEntity record) => EntityField record typ -> DB.Label
 fieldName f | fieldHaskell fd == HaskellName "Id" = id_
@@ -1075,6 +1041,7 @@ instance DB.Val PersistValue where
   val x@(PersistObjectId _) = DB.ObjId $ persistObjectIdToDbOid x
   val (PersistTimeOfDay _)  = throw $ PersistMongoDBUnsupported "PersistTimeOfDay not implemented for the MongoDB backend. only PersistUTCTime currently implemented"
   val (PersistRational _)   = throw $ PersistMongoDBUnsupported "PersistRational not implemented for the MongoDB backend"
+  val (PersistArray a)      = DB.val $ PersistList a
   val (PersistDbSpecific _)   = throw $ PersistMongoDBUnsupported "PersistDbSpecific not implemented for the MongoDB backend"
   cast' (DB.Float x)  = Just (PersistDouble x)
   cast' (DB.Int32 x)  = Just $ PersistInt64 $ fromIntegral x
@@ -1265,7 +1232,7 @@ instance MongoRegexSearchable rs => MongoRegexSearchable [rs]
 (=~.) :: forall record searchable. (MongoRegexSearchable searchable, PersistEntity record, PersistEntityBackend record ~ DB.MongoContext) => EntityField record searchable -> MongoRegex -> Filter record
 fld =~. val = BackendFilter $ RegExpFilter fld val
 
-data MongoFilterOperator typ = PersistFilterOperator (Either typ [typ]) PersistFilter
+data MongoFilterOperator typ = PersistFilterOperator (FilterValue typ) PersistFilter
                              | MongoFilterOperator DB.Value
 
 data UpdateValueOp typ =
@@ -1366,7 +1333,6 @@ infixr 4 `nestNotIn`
 infixr 4 `anyEq`
 infixr 4 `nestAnyEq`
 infixr 4 `nestBsonEq`
-infixr 4 `multiBsonEq`
 infixr 4 `anyBsonEq`
 
 infixr 4 `nestSet`
@@ -1398,7 +1364,7 @@ nestedFilterOp :: forall record typ.
        , PersistEntityBackend record ~ DB.MongoContext
        ) => PersistFilter -> NestedField record typ -> typ -> Filter record
 nestedFilterOp op nf v = BackendFilter $
-   NestedFilter nf $ PersistFilterOperator (Left v) op
+   NestedFilter nf $ PersistFilterOperator (FilterValue v) op
 
 -- | same as `nestEq`, but give a BSON Value
 nestBsonEq :: forall record typ.
@@ -1421,7 +1387,7 @@ anyEq :: forall record typ.
         , PersistEntityBackend record ~ DB.MongoContext
         ) => EntityField record [typ] -> typ -> Filter record
 fld `anyEq` val = BackendFilter $
-    ArrayFilter fld $ PersistFilterOperator (Left val) Eq
+    ArrayFilter fld $ PersistFilterOperator (FilterValue val) Eq
 
 -- | Like nestEq, but for an embedded list.
 -- Checks to see if the nested list contains an item.
@@ -1430,14 +1396,7 @@ nestAnyEq :: forall record typ.
         , PersistEntityBackend record ~ DB.MongoContext
         ) => NestedField record [typ] -> typ -> Filter record
 fld `nestAnyEq` val = BackendFilter $
-    NestedArrayFilter fld $ PersistFilterOperator (Left val) Eq
-
-multiBsonEq :: forall record typ.
-        ( PersistField typ
-        , PersistEntityBackend record ~ DB.MongoContext
-        ) => EntityField record [typ] -> DB.Value -> Filter record
-multiBsonEq = anyBsonEq
-{-# DEPRECATED multiBsonEq "Please use anyBsonEq instead" #-}
+    NestedArrayFilter fld $ PersistFilterOperator (FilterValue val) Eq
 
 -- | same as `anyEq`, but give a BSON Value
 anyBsonEq :: forall record typ.
@@ -1508,10 +1467,10 @@ nestedUpdateOp op nf v = BackendUpdate $
 
 -- | Intersection of lists: if any value in the field is found in the list.
 inList :: PersistField typ => EntityField v [typ] -> [typ] -> Filter v
-f `inList` a = Filter (unsafeCoerce f) (Right a) In
+f `inList` a = Filter (unsafeCoerce f) (FilterValues a) In
 infix 4 `inList`
 
 -- | No intersection of lists: if no value in the field is found in the list.
 ninList :: PersistField typ => EntityField v [typ] -> [typ] -> Filter v
-f `ninList` a = Filter (unsafeCoerce f) (Right a) In
+f `ninList` a = Filter (unsafeCoerce f) (FilterValues a) In
 infix 4 `ninList`
